@@ -1,0 +1,612 @@
+//! `forkd` — CLI entrypoint.
+//!
+//! Subcommands:
+//!   forkd snapshot --tag <name> --kernel <path> --rootfs <path>
+//!   forkd fork --tag <name> --n <N>
+//!
+//! Snapshots live under $XDG_DATA_HOME/forkd/snapshots/<tag>/.
+
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use forkd_vmm::{
+    eval_at, eval_in_netns, exec_at, exec_in_netns, ping_at, ping_in_netns, BootConfig, ForkOpts,
+    NetworkConfig, Snapshot, Vm,
+};
+use std::path::PathBuf;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Parser)]
+#[command(
+    name = "forkd",
+    version,
+    about = "Fork microVMs the way you fork processes."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Boot a parent VM, warm it up, snapshot to disk.
+    Snapshot {
+        /// Name of the snapshot. Becomes ~/.local/share/forkd/snapshots/<tag>/.
+        #[arg(long)]
+        tag: String,
+        /// Path to vmlinux kernel.
+        #[arg(long, env = "FORKD_KERNEL")]
+        kernel: PathBuf,
+        /// Path to rootfs image. Pass `.ext4` for read-write, or `.squashfs` for read-only.
+        #[arg(long, env = "FORKD_ROOTFS")]
+        rootfs: PathBuf,
+        /// Mount rootfs read-write (auto-enabled for `*.ext4`).
+        #[arg(long)]
+        rw: bool,
+        /// Host tap device name to attach as the guest's eth0.
+        /// Create with `scripts/host-tap.sh` (e.g. forkd-tap0).
+        #[arg(long, env = "FORKD_TAP")]
+        tap: Option<String>,
+        /// Seconds to wait for guest to settle before snapshotting.
+        #[arg(long, default_value_t = 10)]
+        boot_wait_secs: u64,
+    },
+    /// Fork N children from a tagged snapshot.
+    Fork {
+        #[arg(long)]
+        tag: String,
+        #[arg(long, short)]
+        n: usize,
+        /// Seconds to let children run before reporting / shutting down.
+        #[arg(long, default_value_t = 2)]
+        settle_secs: u64,
+        /// Spawn each child inside its own `forkd-child-<i>` netns.
+        /// Run `sudo scripts/netns-setup.sh N` first.
+        #[arg(long)]
+        per_child_netns: bool,
+        /// Optional cgroup v2 memory limit per child, in MiB.
+        /// Children exceeding this are OOM-killed by the kernel.
+        /// Requires root or a delegated cgroup. See `crates/forkd-vmm/src/cgroup.rs`.
+        #[arg(long)]
+        memory_limit_mib: Option<u64>,
+    },
+    /// Run a command inside a forked child via the guest agent.
+    ///
+    /// Example: forkd exec -- python3 -c "import numpy; print(numpy.zeros(3))"
+    Exec {
+        /// Address of the guest agent. Default matches NetworkConfig::default_tap().
+        #[arg(long, default_value = "10.42.0.2:8888")]
+        target: String,
+        /// Net namespace to enter (e.g. `forkd-child-3`). Requires root.
+        #[arg(long)]
+        child: Option<String>,
+        /// Command timeout in seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Command and args (everything after `--`).
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Ping the guest agent to verify it's up.
+    Ping {
+        #[arg(long, default_value = "10.42.0.2:8888")]
+        target: String,
+        #[arg(long)]
+        child: Option<String>,
+    },
+    /// Evaluate a Python expression against the warmed PID-1 interpreter.
+    ///
+    /// Example: forkd eval -- "numpy.zeros(3).sum()"
+    Eval {
+        #[arg(long, default_value = "10.42.0.2:8888")]
+        target: String,
+        #[arg(long)]
+        child: Option<String>,
+        /// Python expression to evaluate (everything after `--`).
+        #[arg(last = true)]
+        code: Vec<String>,
+    },
+    /// Build a parent rootfs ext4 image from any Docker image.
+    ///
+    /// Replaces hand-running scripts/build-rootfs.sh. The resulting
+    /// .ext4 ships with /forkd-init.sh + /forkd-agent.py preinstalled
+    /// so the snapshot's PID 1 imports your deps and serves the agent.
+    ///
+    /// Example: forkd parent build python:3.12-slim --extra "python3-numpy"
+    Parent {
+        #[command(subcommand)]
+        action: ParentAction,
+    },
+    /// Boot a one-shot sandbox without managing a snapshot tag.
+    ///
+    /// Equivalent to: build rootfs (if needed) → snapshot → fork 1 →
+    /// exec command → shutdown. Suitable for "spawn me a quick sandbox"
+    /// use cases (vs. the high-throughput `forkd fork` flow).
+    ///
+    /// Example: forkd run --image python:3.12-slim -- python -c 'print(1+1)'
+    Run {
+        /// Docker image to run.
+        #[arg(long)]
+        image: String,
+        /// Extra apt packages to bake in.
+        #[arg(long)]
+        extra: Vec<String>,
+        /// Image cache directory.
+        #[arg(long, env = "FORKD_RUN_CACHE", default_value = "/var/cache/forkd")]
+        cache: PathBuf,
+        /// Kernel path.
+        #[arg(long, env = "FORKD_KERNEL")]
+        kernel: PathBuf,
+        /// Host tap (created via scripts/host-tap.sh).
+        #[arg(long, env = "FORKD_TAP", default_value = "forkd-tap0")]
+        tap: String,
+        /// Command to run (everything after `--`).
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Show where snapshots are stored.
+    Where,
+}
+
+#[derive(Subcommand)]
+enum ParentAction {
+    /// Convert a Docker image into a writable ext4 rootfs.
+    Build {
+        /// Docker image (e.g. `python:3.12-slim`, `ubuntu:24.04`).
+        image: String,
+        /// Output ext4 file (default: ./<image-slug>.ext4).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// Image size in MiB (default 1536).
+        #[arg(long, default_value_t = 1536)]
+        size_mib: u32,
+        /// Extra apt packages to install on top of the base image.
+        #[arg(long)]
+        extra: Vec<String>,
+    },
+}
+
+fn data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(d).join("forkd");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home).join(".local/share/forkd")
+}
+
+fn snapshot_dir(tag: &str) -> PathBuf {
+    data_dir().join("snapshots").join(tag)
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+    match cli.command {
+        Cmd::Snapshot {
+            tag,
+            kernel,
+            rootfs,
+            rw,
+            tap,
+            boot_wait_secs,
+        } => snapshot_cmd(tag, kernel, rootfs, rw, tap, boot_wait_secs),
+        Cmd::Fork {
+            tag,
+            n,
+            settle_secs,
+            per_child_netns,
+            memory_limit_mib,
+        } => fork_cmd(tag, n, settle_secs, per_child_netns, memory_limit_mib),
+        Cmd::Exec {
+            target,
+            child,
+            timeout_secs,
+            cmd,
+        } => exec_cmd(target, child, timeout_secs, cmd),
+        Cmd::Ping { target, child } => ping_cmd(target, child),
+        Cmd::Eval {
+            target,
+            child,
+            code,
+        } => eval_cmd(target, child, code),
+        Cmd::Parent { action } => match action {
+            ParentAction::Build {
+                image,
+                output,
+                size_mib,
+                extra,
+            } => parent_build_cmd(image, output, size_mib, extra),
+        },
+        Cmd::Run {
+            image,
+            extra,
+            cache,
+            kernel,
+            tap,
+            cmd,
+        } => run_cmd(image, extra, cache, kernel, tap, cmd),
+        Cmd::Where => {
+            println!("{}", data_dir().display());
+            Ok(())
+        }
+    }
+}
+
+fn parent_build_cmd(
+    image: String,
+    output: Option<PathBuf>,
+    size_mib: u32,
+    extra: Vec<String>,
+) -> Result<()> {
+    // Default output: ./<sanitized-image>.ext4 in current dir.
+    let out = output.unwrap_or_else(|| {
+        let slug: String = image
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        PathBuf::from(format!("{slug}.ext4"))
+    });
+
+    // Locate scripts/build-rootfs.sh by walking up from the binary.
+    let script = find_script("build-rootfs.sh")?;
+
+    eprintln!(
+        "==> forkd parent build:\n     image:   {}\n     output:  {}\n     size:    {} MiB\n     extras:  {}",
+        image,
+        out.display(),
+        size_mib,
+        if extra.is_empty() {
+            "(none)".to_string()
+        } else {
+            extra.join(" ")
+        }
+    );
+
+    // The build script does sudo internally for mount/chroot. Run as
+    // current user; the user is expected to run `sudo forkd ...` once
+    // for the whole pipeline (kvm + netns + bind mount all need root).
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script)
+        .arg(&image)
+        .arg(&out)
+        .arg(size_mib.to_string());
+    for pkg in &extra {
+        cmd.arg(pkg);
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to invoke bash {}", script.display()))?;
+    if !status.success() {
+        bail!(
+            "build-rootfs.sh exited with status {status}.\n\
+             Hint: this command needs root for docker + mkfs.ext4. Try `sudo -E forkd parent build ...`"
+        );
+    }
+    eprintln!("✓ wrote {}", out.display());
+    eprintln!(
+        "  next: forkd snapshot --tag <name> --kernel <vmlinux> --rootfs {} --tap forkd-tap0",
+        out.display()
+    );
+    Ok(())
+}
+
+/// `forkd run` — one-shot sandbox: build (if needed) → snapshot → fork → exec → kill.
+fn run_cmd(
+    image: String,
+    extra: Vec<String>,
+    cache: PathBuf,
+    kernel: PathBuf,
+    tap: String,
+    cmd: Vec<String>,
+) -> Result<()> {
+    if cmd.is_empty() {
+        bail!("no command provided. Usage: forkd run --image <img> -- <cmd> [args...]");
+    }
+    if !kernel.exists() {
+        bail!(
+            "kernel not found: {}\n\
+             set --kernel or FORKD_KERNEL",
+            kernel.display()
+        );
+    }
+
+    // 1. Materialize the rootfs (cached).
+    std::fs::create_dir_all(&cache).ok();
+    let slug: String = image
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let rootfs = cache.join(format!("{slug}.ext4"));
+    if !rootfs.exists() {
+        eprintln!(
+            "==> building rootfs for {image} (cached at {})",
+            rootfs.display()
+        );
+        parent_build_cmd(image.clone(), Some(rootfs.clone()), 1536, extra)?;
+    } else {
+        eprintln!("==> using cached rootfs {}", rootfs.display());
+    }
+
+    // 2. Snapshot a one-off tag.
+    let tag = format!("run-{slug}");
+    eprintln!("==> snapshot --tag {tag}");
+    snapshot_cmd(tag.clone(), kernel, rootfs, true, Some(tap), 10)?;
+
+    // 3. Fork 1 child + exec the command via the guest agent.
+    eprintln!("==> spawning sandbox and running command...");
+    let snap_dir = snapshot_dir(&tag);
+    let snapshot = Snapshot {
+        vmstate: snap_dir.join("vmstate"),
+        memory: snap_dir.join("memory.bin"),
+    };
+    let work_dir = std::env::temp_dir().join(format!("forkd-run-{tag}"));
+    let result = snapshot
+        .restore_many_with(
+            ForkOpts {
+                n: 1,
+                per_child_netns: false,
+                memory_limit_mib: None,
+            },
+            &work_dir,
+        )
+        .context("restore_many failed")?;
+
+    // Wait for the agent to come up, then exec the command.
+    let target = "10.42.0.2:8888".to_string();
+    let mut alive = false;
+    for _ in 0..30 {
+        if ping_at(&target).is_ok() {
+            alive = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    if !alive {
+        drop(result);
+        bail!("sandbox agent never responded at {target}");
+    }
+    let resp = exec_at(&target, cmd, Duration::from_secs(60))?;
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+    let exit = resp.exit_code;
+
+    // Shutdown.
+    for c in &result.children {
+        let _ = c.shutdown();
+    }
+    drop(result);
+
+    std::process::exit(exit);
+}
+
+/// Locate a helper script in the repo's `scripts/` dir. Looks at common
+/// install layouts: alongside the binary, under /usr/local/share/forkd,
+/// or by walking up from the binary's parent.
+fn find_script(name: &str) -> Result<PathBuf> {
+    // Try $FORKD_SCRIPTS_DIR first.
+    if let Ok(dir) = std::env::var("FORKD_SCRIPTS_DIR") {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    // Walk up from current_exe looking for `scripts/<name>`.
+    if let Ok(mut exe) = std::env::current_exe() {
+        for _ in 0..6 {
+            exe.pop();
+            let candidate = exe.join("scripts").join(name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    // Final fallback.
+    let p = PathBuf::from("/usr/local/share/forkd/scripts").join(name);
+    if p.exists() {
+        return Ok(p);
+    }
+
+    bail!(
+        "could not find scripts/{} — set FORKD_SCRIPTS_DIR to the forkd repo's `scripts/` dir",
+        name
+    )
+}
+
+fn exec_cmd(
+    target: String,
+    child: Option<String>,
+    timeout_secs: u64,
+    cmd: Vec<String>,
+) -> Result<()> {
+    if cmd.is_empty() {
+        bail!("no command provided. Usage: forkd exec -- <cmd> [args...]");
+    }
+    let timeout = Duration::from_secs(timeout_secs);
+    let resp = match child {
+        Some(ns) => exec_in_netns(&ns, target, cmd, timeout)?,
+        None => exec_at(&target, cmd, timeout)?,
+    };
+    if !resp.stdout.is_empty() {
+        print!("{}", resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        eprint!("{}", resp.stderr);
+    }
+    if let Some(err) = resp.error {
+        bail!("agent error: {err}");
+    }
+    std::process::exit(resp.exit_code);
+}
+
+fn ping_cmd(target: String, child: Option<String>) -> Result<()> {
+    let pong = match child {
+        Some(ns) => ping_in_netns(&ns, target)?,
+        None => ping_at(&target)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&pong)?);
+    Ok(())
+}
+
+fn eval_cmd(target: String, child: Option<String>, code: Vec<String>) -> Result<()> {
+    if code.is_empty() {
+        bail!("no expression provided. Usage: forkd eval -- <python expr>");
+    }
+    let expr = code.join(" ");
+    let v = match child {
+        Some(ns) => eval_in_netns(&ns, target, expr)?,
+        None => eval_at(&target, expr)?,
+    };
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        eprintln!("error: {err}");
+        if let Some(tb) = v.get("traceback").and_then(|t| t.as_str()) {
+            eprintln!("{tb}");
+        }
+        std::process::exit(1);
+    }
+    if let Some(r) = v.get("result").and_then(|r| r.as_str()) {
+        println!("{r}");
+    }
+    Ok(())
+}
+
+fn snapshot_cmd(
+    tag: String,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    rw_flag: bool,
+    tap: Option<String>,
+    boot_wait_secs: u64,
+) -> Result<()> {
+    if !kernel.exists() {
+        bail!("kernel not found: {}", kernel.display());
+    }
+    if !rootfs.exists() {
+        bail!("rootfs not found: {}", rootfs.display());
+    }
+
+    // Auto-detect ext4 by extension; or explicit --rw flag.
+    let rw = rw_flag
+        || rootfs
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == "ext4");
+
+    let work_dir = std::env::temp_dir().join(format!("forkd-parent-{tag}"));
+    let mut cfg = if rw {
+        eprintln!("    rootfs mode: read-write (ext4)");
+        BootConfig::ext4_rw(kernel, rootfs, work_dir.clone())
+    } else {
+        eprintln!("    rootfs mode: read-only (squashfs)");
+        BootConfig::quickstart(kernel, rootfs, work_dir.clone())
+    };
+
+    if let Some(tap_name) = tap {
+        let net = NetworkConfig::default_tap(&tap_name);
+        eprintln!(
+            "    network: virtio-net via tap {} (guest {} ↔ host {})",
+            tap_name,
+            net.guest_ip.as_deref().unwrap_or("?"),
+            net.host_gw.as_deref().unwrap_or("?")
+        );
+        cfg = cfg.with_network(net);
+    }
+
+    eprintln!("==> booting parent VM (work_dir={})...", work_dir.display());
+    let mut vm = Vm::boot(&cfg).context("boot parent")?;
+    eprintln!("    firecracker pid: {}", vm.pid());
+
+    eprintln!("==> warming up for {boot_wait_secs}s...");
+    thread::sleep(Duration::from_secs(boot_wait_secs));
+
+    eprintln!("==> pausing...");
+    vm.pause().context("pause parent")?;
+
+    let snap_dir = snapshot_dir(&tag);
+    std::fs::create_dir_all(&snap_dir).context("create snapshot dir")?;
+    let vmstate = snap_dir.join("vmstate");
+    let memory = snap_dir.join("memory.bin");
+
+    eprintln!("==> snapshotting to {}...", snap_dir.display());
+    let t = Instant::now();
+    vm.snapshot_to(vmstate, memory).context("snapshot create")?;
+    eprintln!("    snapshot took {} ms", t.elapsed().as_millis());
+
+    vm.kill().context("kill parent")?;
+    eprintln!("✓ tag '{tag}' ready. Try: forkd fork --tag {tag} --n 10");
+    Ok(())
+}
+
+fn fork_cmd(
+    tag: String,
+    n: usize,
+    settle_secs: u64,
+    per_child_netns: bool,
+    memory_limit_mib: Option<u64>,
+) -> Result<()> {
+    let snap_dir = snapshot_dir(&tag);
+    let vmstate = snap_dir.join("vmstate");
+    let memory = snap_dir.join("memory.bin");
+
+    if !vmstate.exists() {
+        bail!(
+            "snapshot tag '{tag}' not found at {}\n\
+             run 'forkd snapshot --tag {tag} ...' first",
+            snap_dir.display()
+        );
+    }
+
+    let snapshot = Snapshot { vmstate, memory };
+    let work_dir = std::env::temp_dir().join(format!("forkd-fork-{tag}"));
+
+    eprintln!(
+        "==> forking {n} children from snapshot '{tag}'{}...",
+        if per_child_netns {
+            " (per-child netns)"
+        } else {
+            ""
+        }
+    );
+    let result = snapshot
+        .restore_many_with(
+            ForkOpts {
+                n,
+                per_child_netns,
+                memory_limit_mib,
+            },
+            &work_dir,
+        )
+        .context("restore_many_with failed")?;
+
+    let total_ms = result.spawn_ms + result.restore_ms;
+    println!("✓ all sockets up in {} ms", result.spawn_ms);
+    println!(
+        "✓ {n} restores fired in parallel in {} ms",
+        result.restore_ms
+    );
+    println!("✓ total wall-clock: {total_ms} ms");
+
+    eprintln!("==> letting children settle for {settle_secs}s...");
+    thread::sleep(Duration::from_secs(settle_secs));
+
+    let alive = result.children.iter().filter(|c| c.is_alive()).count();
+    println!("✓ {alive} / {n} children alive");
+
+    eprintln!("==> shutting down...");
+    for c in &result.children {
+        let _ = c.shutdown();
+    }
+    thread::sleep(Duration::from_secs(2));
+    drop(result); // triggers kill via Drop for any still alive
+
+    Ok(())
+}

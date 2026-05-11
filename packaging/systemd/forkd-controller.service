@@ -1,0 +1,46 @@
+[Unit]
+Description=forkd controller daemon
+Documentation=https://github.com/deeplethe/forkd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/forkd-controller serve \
+  --bind 127.0.0.1:8889 \
+  --state /var/lib/forkd/state.json \
+  --audit-log /var/log/forkd/audit.log \
+  --token-file /etc/forkd/token
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+StateDirectory=forkd
+LogsDirectory=forkd
+RuntimeDirectory=forkd
+
+# The daemon manages netns + cgroup, both of which need CAP_NET_ADMIN
+# and CAP_SYS_ADMIN. It must be able to write under /sys/fs/cgroup
+# (a delegated subtree is preferred over running as root).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SETUID CAP_SETGID
+
+# Hardening — relaxed only where forkd genuinely needs the access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/forkd /var/log/forkd /sys/fs/cgroup
+ProtectControlGroups=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=net mnt user pid
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

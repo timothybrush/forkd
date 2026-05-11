@@ -27,6 +27,11 @@ sudo install -m 0644 packaging/systemd/forkd-controller.service /etc/systemd/sys
 sudo mkdir -p /etc/forkd /var/lib/forkd /var/log/forkd
 sudo bash -c 'head -c 32 /dev/urandom | base64 > /etc/forkd/token'
 sudo chmod 600 /etc/forkd/token
+
+# Optional but recommended for any non-loopback bind: TLS.
+# Drop a cert.pem + key.pem (Let's Encrypt or your internal CA) into
+# /etc/forkd/tls/ and add --tls-cert / --tls-key to the systemd ExecStart.
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now forkd-controller
 ```

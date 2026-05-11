@@ -51,6 +51,13 @@ enum Cmd {
         /// safe only for loopback-bound, single-tenant developer use.
         #[arg(long, env = "FORKD_TOKEN_FILE")]
         token_file: Option<PathBuf>,
+        /// PEM-encoded TLS server certificate chain. Required with
+        /// --tls-key to enable HTTPS.
+        #[arg(long, env = "FORKD_TLS_CERT")]
+        tls_cert: Option<PathBuf>,
+        /// PEM-encoded TLS private key matching --tls-cert.
+        #[arg(long, env = "FORKD_TLS_KEY")]
+        tls_key: Option<PathBuf>,
     },
 }
 
@@ -71,6 +78,8 @@ async fn main() -> Result<()> {
             snapshot_root,
             audit_log,
             token_file,
+            tls_cert,
+            tls_key,
         } => {
             let defaults = DaemonConfig::default();
             run_daemon(DaemonConfig {
@@ -79,6 +88,8 @@ async fn main() -> Result<()> {
                 snapshot_root: snapshot_root.unwrap_or(defaults.snapshot_root),
                 audit_log,
                 token_file,
+                tls_cert,
+                tls_key,
             })
             .await
         }

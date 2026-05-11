@@ -26,7 +26,8 @@ forkd assumes:
 
 | Concern | Default | How to harden |
 |---|---|---|
-| Daemon bind | `127.0.0.1:8889` (loopback only) | Override at your own risk; require TLS-terminating reverse proxy |
+| Daemon bind | `127.0.0.1:8889` (loopback only) | Override at your own risk; pair with `--tls-cert` + `--token-file` |
+| TLS | off (loopback HTTP) | `--tls-cert /etc/forkd/tls/cert.pem --tls-key ...` (rustls 0.23, modern cipher suites only) |
 | Authentication | none | `--token-file /etc/forkd/token` |
 | Per-child memory cap | none | `memory_limit_mib` per sandbox |
 | Per-child netns | shared (same host bridge) | `per_child_netns: true` + `scripts/netns-setup.sh N` |
@@ -34,11 +35,25 @@ forkd assumes:
 | Guest agent reachability | inside netns | each child's agent is reachable only from its own netns |
 | Audit log | `/var/log/forkd/audit.log`, JSON lines | tail with vector / fluentbit; rotate with logrotate |
 
+## TLS
+
+Pass `--tls-cert <cert.pem> --tls-key <key.pem>` to `forkd-controller
+serve` (or set `FORKD_TLS_CERT` / `FORKD_TLS_KEY`). The daemon uses
+rustls 0.23 with the aws-lc-rs crypto provider; TLS 1.2 and TLS 1.3
+are accepted, legacy cipher suites are not negotiable. Both PEM
+files must be readable by the daemon's user and SHOULD have mode 0600.
+
+Operationally:
+
+- Use a real CA (Let's Encrypt or your internal PKI). Self-signed
+  certs work but require clients to bypass cert validation.
+- Rotate by writing new files and `systemctl restart forkd-controller`.
+- Bearer-token auth is **not** automatically enabled by TLS — supply
+  `--token-file` as well for any non-loopback deployment.
+
 ## What forkd does not do (yet)
 
 - **Multi-node scheduling.** One daemon = one host. No HA, no failover.
-- **TLS termination.** Put a reverse proxy (nginx, traefik) in front
-  for non-loopback access.
 - **Default-deny egress.** Children share the host's MASQUERADE rule;
   outbound to the internet works by default. For an allow-list policy,
   add per-netns iptables rules after `scripts/netns-setup.sh`.

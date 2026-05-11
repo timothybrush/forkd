@@ -54,6 +54,8 @@ impl TestDaemon {
             snapshot_root: td.path().join("snapshots"),
             audit_log: td.path().join("audit.log"),
             token_file,
+            tls_cert: None,
+            tls_key: None,
         };
 
         // We don't have a clean shutdown hook from outside (run_daemon
@@ -157,6 +159,96 @@ async fn end_to_end_auth_accepts_valid_token() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["api"], "v1");
+}
+
+struct TlsTestDaemon {
+    base: String,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+    _td: TempDir,
+}
+
+impl TlsTestDaemon {
+    async fn start() -> Self {
+        // rcgen produces a fresh, self-signed CA-less leaf cert for
+        // 127.0.0.1 + localhost. Good enough for an in-process test
+        // that pairs it with reqwest's danger_accept_invalid_certs.
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+        ])
+        .unwrap();
+        let td = TempDir::new().unwrap();
+        let cert_path = td.path().join("cert.pem");
+        let key_path = td.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let port = pick_free_port();
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let cfg = DaemonConfig {
+            bind,
+            state_file: td.path().join("state.json"),
+            snapshot_root: td.path().join("snapshots"),
+            audit_log: td.path().join("audit.log"),
+            token_file: None,
+            tls_cert: Some(cert_path),
+            tls_key: Some(key_path),
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = run_daemon(cfg) => {},
+                _ = rx => {},
+            }
+        });
+
+        let base = format!("https://127.0.0.1:{port}");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if client.get(format!("{base}/healthz")).send().await.is_ok() {
+                return Self {
+                    base,
+                    _shutdown: tx,
+                    _td: td,
+                };
+            }
+        }
+        panic!("TLS daemon never became reachable on {base}");
+    }
+}
+
+#[tokio::test]
+async fn end_to_end_tls_serves_https() {
+    let d = TlsTestDaemon::start().await;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let h = client
+        .get(format!("{}/healthz", d.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h.status(), 200);
+    let body: Value = h.json().await.unwrap();
+    assert_eq!(body["ok"], Value::Bool(true));
+
+    let v: Value = client
+        .get(format!("{}/version", d.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(v["api"], "v1");
 }
 

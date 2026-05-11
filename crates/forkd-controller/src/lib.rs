@@ -10,11 +10,14 @@ pub mod state;
 
 use anyhow::{Context, Result};
 use axum::middleware;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::audit::AuditSink;
 use crate::auth::AuthConfig;
@@ -35,6 +38,12 @@ pub struct DaemonConfig {
     /// token. When `None`, the daemon runs unauthenticated — safe only
     /// for loopback-bound, single-tenant developer setups.
     pub token_file: Option<PathBuf>,
+    /// PEM-encoded TLS server certificate chain. Required together
+    /// with `tls_key` to enable HTTPS. When either is unset the daemon
+    /// serves plain HTTP (intended for loopback-only deployments).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM-encoded TLS private key matching `tls_cert`.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -45,6 +54,8 @@ impl Default for DaemonConfig {
             snapshot_root: forkd_vmm::paths::data_dir().join("snapshots"),
             audit_log: PathBuf::from("/var/log/forkd/audit.log"),
             token_file: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -104,39 +115,73 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
             async move { audit::audit_layer(sink, req, next).await }
         }));
 
-    let listener = tokio::net::TcpListener::bind(cfg.bind)
-        .await
-        .with_context(|| format!("bind {}", cfg.bind))?;
-    let actual = listener.local_addr().context("read back bound address")?;
-    tracing::info!(addr = %actual, "forkd-controller listening");
+    // axum-server gives us a unified bind path for TLS and plain HTTP,
+    // plus a Handle for cooperative shutdown that drains in-flight
+    // requests up to a deadline.
+    let handle = Handle::new();
+    spawn_shutdown_signal(handle.clone());
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("axum serve")?;
+    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(c), Some(k)) => Some(load_tls(c, k).await?),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("--tls-cert and --tls-key must be supplied together");
+        }
+        (None, None) => None,
+    };
+
+    match tls {
+        Some(tls_cfg) => {
+            tracing::info!(addr = %cfg.bind, "forkd-controller listening (HTTPS)");
+            axum_server::bind_rustls(cfg.bind, tls_cfg)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .context("axum_server bind_rustls")?;
+        }
+        None => {
+            tracing::info!(addr = %cfg.bind, "forkd-controller listening (plain HTTP)");
+            axum_server::bind(cfg.bind)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await
+                .context("axum_server bind")?;
+        }
+    }
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install ctrl_c handler");
-    };
+async fn load_tls(cert: &Path, key: &Path) -> Result<RustlsConfig> {
+    // axum-server's RustlsConfig wants both PEM files. rustls 0.23
+    // requires a crypto provider be installed before any TLS handshake;
+    // install aws-lc-rs as the default if nothing's been set yet.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    RustlsConfig::from_pem_file(cert, key)
+        .await
+        .with_context(|| format!("load TLS cert {} / key {}", cert.display(), key.display()))
+}
 
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
+fn spawn_shutdown_signal(handle: Handle) {
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+        #[cfg(unix)]
+        let terminate = async {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                sig.recv().await;
+            }
+        };
 
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
-        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
-    }
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
+            _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+        }
+        handle.graceful_shutdown(Some(Duration::from_secs(30)));
+    });
 }

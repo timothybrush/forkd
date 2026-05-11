@@ -105,6 +105,44 @@ problems the architecture leaves on the table.
 
 ---
 
+## How forkd compares
+
+The sandbox-runtime space has a wide spread of designs. The table
+below summarises positioning of forkd against the most-cited
+open-source projects. Numbers in quotes are **as advertised by the
+upstream project** unless they match a row in our benchmark chart
+above. forkd does not measure other projects on workloads they were
+not designed for.
+
+| Project | Primitive | Cold-start (advertised) | Fork-from-warm | Per-child resource quotas | Built-in auth / TLS | License |
+|---|---|---:|:---:|:---:|:---:|---|
+| **forkd** | microVM (Firecracker) + snapshot CoW fork | 101 ms (measured, N=100, import-numpy task) | ✅ | ✅ cgroup v2 `memory.max` today; cpu/io/pids next | ✅ bearer + rustls TLS | Apache 2.0 |
+| [Tencent CubeSandbox](https://github.com/TencentCloud/CubeSandbox) | microVM (RustVMM + KVM) | "<60 ms" cold, "<150 ms under concurrent" | "coming soon" (event-level snapshot rollback) | per-instance < 5 MiB; quotas not documented | not documented in OSS docs | Apache 2.0 |
+| [Daytona](https://github.com/daytonaio/daytona) | OCI workspace (Docker-compatible, per-workspace kernel claim) | "<90 ms" to spin up a workspace | ❌ snapshot for resume, no fork-from-warm | yes (resource caps per workspace) | yes (managed and self-hosted) | AGPL-3.0 |
+| [Alibaba OpenSandbox](https://github.com/alibaba/OpenSandbox) | abstraction layer over Docker / Kubernetes / gVisor / Kata / Firecracker | not advertised | ❌ (delegates to underlying runtime) | yes (via runtime + K8s) | yes (ingress gateway + egress policy) | Apache 2.0 |
+| [E2B](https://github.com/e2b-dev/E2B) | sandbox infra (Firecracker under the hood) | not advertised in OSS repo | ❌ (managed service "Sandbox" persists, doesn't fork) | yes (managed) | yes (managed) | Apache 2.0 |
+| Modal | proprietary, snapshot-fork primitive ("Modal Sandbox") | not public; advertises sub-second cold-starts | ✅ (closed source) | ✅ | ✅ | proprietary SaaS |
+| Firecracker (raw) | microVM | ~750 ms full boot, no orchestration | snapshot/restore exists; CoW is up to caller | n/a — primitive only | n/a | Apache 2.0 |
+| Docker (runc) | OCI container | seconds for full image pull + start | ❌ | yes (cgroups) | n/a | Apache 2.0 |
+| gVisor (runsc) | userspace kernel container | seconds | ❌ | yes (cgroups) | n/a | Apache 2.0 |
+
+**Where forkd fits.** If your workload imports heavy Python or ML
+state at the start of every request, forkd's parent-snapshot CoW
+collapses that cost across the entire fan-out — the parent imported
+numpy once, every child inherits the result. CubeSandbox has a
+faster pure cold-start; Daytona is the most polished workspace-style
+runtime; OpenSandbox is the right pick when you want one orchestration
+API across multiple isolation backends. Modal is the only existing
+production system with the "fork from warm" primitive — forkd is the
+open-source analogue.
+
+**Where forkd is not the right pick.** Function-level snapshot
+runtimes that give up real Linux (single-vCPU, serial I/O only) can
+beat forkd's ~100 ms by an order of magnitude — at the cost of not
+running real Python servers, `apt install`, or outbound HTTPS.
+
+---
+
 ## Quick start
 
 Requires: x86_64 Linux with KVM, Ubuntu 22.04 or newer.

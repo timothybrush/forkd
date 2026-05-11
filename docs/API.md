@@ -1,8 +1,9 @@
 # forkd HTTP API (v1)
 
 The forkd controller exposes a JSON/HTTP API on `127.0.0.1:8889` by
-default. All routes except `/healthz` require a bearer token when the
-daemon is started with `--token-file`.
+default. Pass `--tls-cert`/`--tls-key` to serve HTTPS instead of
+plain HTTP. All routes except `/healthz` require a bearer token when
+the daemon is started with `--token-file`.
 
 ```http
 Authorization: Bearer <contents-of-token-file>

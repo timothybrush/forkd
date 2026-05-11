@@ -160,6 +160,79 @@ Every request is appended to a JSON-Lines audit log
 path, status, latency in microseconds, user-agent. Log rotation is
 out of process (`logrotate`, `vector`, the journal).
 
+## Related work
+
+The sandbox-runtime space has been growing fast. forkd's contribution
+is the fork-from-warm primitive on a full Linux microVM, with an
+open-source operator surface (REST + auth + TLS + audit + metrics).
+This section sketches how that compares to the projects most worth
+benchmarking against.
+
+### Tencent CubeSandbox
+
+[CubeSandbox](https://github.com/TencentCloud/CubeSandbox) is the
+closest open-source project to forkd in primitive choice: RustVMM-
+based microVMs, KVM isolation, Apache 2.0. The published P95 cold-
+start is "**<60 ms**" with per-instance memory overhead below 5 MiB,
+which beats forkd's pure cold-boot path (forkd's snapshot fork wins
+on the fan-out workload because it skips guest userspace warm-up,
+not because the VM boots faster). CubeSandbox's roadmap mentions
+"event-level snapshot rollback" with "high-frequency snapshot
+rollback at millisecond granularity, enabling rapid fork-based
+exploration environments from any saved state" — when that lands,
+the two projects will overlap meaningfully. Until then forkd's
+distinct value is that fork-from-warm exists today.
+
+### Daytona
+
+[Daytona](https://github.com/daytonaio/daytona) is OCI-workspace
+oriented (Docker-compatible images, per-workspace kernel claim).
+They advertise "**<90 ms** spinning up... from code to execution"
+and a stateful-snapshot model for resume. There is no fork-from-warm
+primitive — each workspace is its own resource. License is
+**AGPL-3.0**, which is a meaningful difference for commercial users
+embedding the runtime in proprietary services. Daytona's polish at
+the workspace + agent-protocol layer is well ahead of forkd; the
+projects target different shapes of workload.
+
+### Alibaba OpenSandbox
+
+[OpenSandbox](https://github.com/alibaba/OpenSandbox) is best thought
+of as an **abstraction layer** over Docker / Kubernetes / gVisor /
+Kata / Firecracker. It exposes a unified ingress gateway, per-sandbox
+egress policy, and multi-language SDKs (Python, Java, JS, .NET, Go).
+Apache 2.0, actively maintained. OpenSandbox does not itself implement
+fork-from-warm; if you want that on top of OpenSandbox, you'd plug a
+runtime that supports it. Conceptually forkd could be slotted in as
+such a runtime in a future integration.
+
+### E2B
+
+[E2B](https://github.com/e2b-dev/E2B) ships an open-source self-host
+path (Apache 2.0) and a managed service. The OSS infra repo uses
+Firecracker under the hood; specific spawn-time numbers are mostly
+quoted from the managed product. There is no fork-from-warm primitive
+in the open repo. forkd's Python SDK is **E2B wire-compatible at the
+`Sandbox` class level** so existing E2B agents can switch by import
+alone, with `sandbox.eval(...)` as the forkd-only extra that uses the
+warmed-PID-1 interpreter.
+
+### Modal
+
+Modal is the only production system known to expose a fork-from-warm
+primitive ("Modal Sandbox", proprietary). They are not open source;
+forkd is the open-source analogue of that primitive specifically.
+Pricing, scheduling, and the full developer-platform layer remain
+their differentiator.
+
+### Firecracker, Docker, gVisor
+
+These are runtimes, not full sandbox products. forkd builds on
+Firecracker directly. Docker (runc) and gVisor (runsc) are in our
+benchmark chart as honest reference points: they cold-boot every
+sandbox and pay the `import numpy` cost N times for an N-sandbox
+fan-out.
+
 ## What forkd does not do
 
 - Replace Modal or E2B as a SaaS.

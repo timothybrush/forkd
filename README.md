@@ -13,7 +13,7 @@
   <a href="https://github.com/deeplethe/forkd/releases"><img alt="Release" src="https://img.shields.io/github/v/release/deeplethe/forkd?style=flat-square&color=4c956c"></a>
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square"></a>
   <a href="https://firecracker-microvm.github.io"><img alt="Firecracker" src="https://img.shields.io/badge/built%20on-Firecracker-blue?style=flat-square"></a>
-  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust"></a>
+  <a href="https://github.com/deeplethe/forkd/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/deeplethe/forkd?style=flat-square&color=eab308&logo=github"></a>
 </p>
 
 A microVM sandbox runtime that forks children from a warmed parent
@@ -329,6 +329,17 @@ Pull requests welcome. Before opening one, please:
    moving; we'd rather align early than ask you to rewrite the patch.
 2. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --all` locally.
 3. Sign-off your commits (`git commit -s`).
+
+---
+
+## Star history
+
+<a href="https://star-history.com/#deeplethe/forkd&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=deeplethe/forkd&type=Date&theme=dark">
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=deeplethe/forkd&type=Date">
+  </picture>
+</a>
 
 ---
 

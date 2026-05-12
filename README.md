@@ -22,9 +22,9 @@
 
 ## Fork 100 microVMs in 101 ms.
 
-A microVM sandbox runtime that forks children from a warmed parent
-snapshot, so each child inherits the parent's address space
-copy-on-write instead of cold-booting its own kernel.
+A microVM sandbox runtime for **AI agent fan-out**. Children fork
+from a warmed parent snapshot, inheriting its address space
+copy-on-write instead of cold-booting their own kernel.
 
 forkd is built on Firecracker. The parent VM boots once, imports
 your runtime (Python + your dependencies, a JIT-warmed JVM, an

@@ -18,6 +18,8 @@
   <a href="https://github.com/deeplethe/forkd/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/deeplethe/forkd?style=flat-square&color=eab308&logo=github"></a>
 </p>
 
+<br/>
+
 ## Overview
 
 A microVM sandbox runtime that forks children from a warmed parent
@@ -35,6 +37,8 @@ diverge.
 The result is two properties at once: per-child KVM isolation, and a
 spawn cost that's closer to `fork(2)` than to a cold-boot VM.
 
+<br/>
+
 ## Properties
 
 - **Hardware isolation.** Each child is its own Firecracker microVM
@@ -49,6 +53,8 @@ spawn cost that's closer to `fork(2)` than to a cold-boot VM.
 - **Operable.** Daemon process owning state, REST API on Unix or TCP,
   Prometheus `/metrics`, append-only JSON audit log, systemd unit.
 - **Open source.** Apache 2.0, no vendor SDK.
+
+<br/>
 
 ## Benchmarks
 
@@ -90,6 +96,8 @@ For one sandbox doing the same numpy expression two ways:
 |---|---:|---|
 | `sandbox.eval("numpy.zeros(5).tolist()")` | 1 ms | Reuses the warmed Python in PID 1 |
 | `sandbox.commands.run("python3 -c '...'")` | 96 ms | Cold subprocess re-imports numpy |
+
+<br/>
 
 ## How it works
 
@@ -147,6 +155,8 @@ flowchart TB
 See [`DESIGN.md`](./DESIGN.md) for the full design and the open
 problems the architecture leaves on the table.
 
+<br/>
+
 ## How forkd compares
 
 The sandbox-runtime space has a wide spread of designs. The table
@@ -156,23 +166,27 @@ upstream project** unless they match a row in our benchmark chart
 above. forkd does not measure other projects on workloads they were
 not designed for.
 
-| Project | Primitive | Cold-start | Fork-from-warm | Quotas | Auth / TLS | License |
+| Project | Primitive | Cold-start (N=100) | Fork-from-warm | Quotas | Auth / TLS | License |
 |---|---|---|:---:|---|---|---|
-| **forkd** | Firecracker + snapshot CoW | **101 ms** measured | ✅ | cgroup `memory.max` | bearer + rustls | Apache 2.0 |
-| [CubeSandbox][cs] | RustVMM + KVM microVM | <60 ms advertised | soon | <5 MiB / instance | not in OSS docs | Apache 2.0 |
-| [Daytona][dy] | OCI workspace | <90 ms advertised | ❌ resume only | per workspace | yes | **AGPL-3.0** |
-| [OpenSandbox][os] | abstraction over Docker/K8s/gVisor/Kata/FC | not advertised | ❌ | via runtime | ingress + egress | Apache 2.0 |
-| [E2B][e2b] | Firecracker (managed) | not in OSS repo | ❌ | managed | managed | Apache 2.0 |
-| [BoxLite][bl] | KVM microVM, OCI guest | not advertised | ❌ stateful Box | KVM + seccomp | `allow_net` per Box | Apache 2.0 |
-| Modal | proprietary snapshot fork | not public | ✅ | ✅ | ✅ | proprietary |
-| Firecracker raw | microVM only | ~750 ms cold boot | manual | n/a | n/a | Apache 2.0 |
-| Docker (runc) | OCI container | seconds | ❌ | cgroups | n/a | Apache 2.0 |
-| gVisor (runsc) | userspace kernel | seconds | ❌ | cgroups | n/a | Apache 2.0 |
+| **forkd** | Firecracker + snapshot CoW | **101 ms** | ✓ | cgroup `memory.max` | bearer + rustls | Apache 2.0 |
+| [CubeSandbox][cs] | RustVMM + KVM microVM | 20.3 s¹ | "coming soon" | <5 MiB / instance | not in OSS | Apache 2.0 |
+| [Daytona][dy] | OCI workspace | <90 ms² | ✗ | per workspace | API keys (platform) | **AGPL-3.0** |
+| [OpenSandbox][os] | Docker / K8s + gVisor / Kata / FC | 122 s | ✗ | via runtime | gateway (k8s) | Apache 2.0 |
+| [E2B][e2b] | Firecracker (in [infra][e2b-infra]) | not in OSS | ✗ | platform | API keys (cloud) | Apache 2.0 |
+| [BoxLite][bl] | KVM / Hypervisor.framework + OCI | 113 s | ✗ stateful Box | KVM + seccomp | egress policy only | Apache 2.0 |
+| Modal | proprietary snapshot fork | not public | ✓ | ✓ | ✓ | proprietary |
+| Firecracker raw | microVM only | 759 ms | manual | n/a | n/a | Apache 2.0 |
+| Docker (runc) | OCI container | 335 s | ✗ | cgroups | n/a | Apache 2.0 |
+| gVisor (runsc) | userspace kernel | 289 s | ✗ | cgroups | n/a | Apache 2.0 |
+
+¹ 77/100 succeeded on this host due to a reflink-copy storage bug under concurrent load; CubeSandbox advertises **<60 ms** single-instance cold-start (P95 90 ms at 50-concurrent). See [bench/CUBESANDBOX.md](./bench/CUBESANDBOX.md).
+² Daytona's advertised number; we did not measure it (workspace runtime, not a fan-out-comparable shape).
 
 [cs]: https://github.com/TencentCloud/CubeSandbox
 [dy]: https://github.com/daytonaio/daytona
 [os]: https://github.com/alibaba/OpenSandbox
 [e2b]: https://github.com/e2b-dev/E2B
+[e2b-infra]: https://github.com/e2b-dev/infra
 [bl]: https://github.com/boxlite-ai/boxlite
 
 **Where forkd fits.** If your workload imports heavy Python or ML
@@ -191,6 +205,8 @@ open-source analogue.
 runtimes that give up real Linux (single-vCPU, serial I/O only) can
 beat forkd's ~100 ms by an order of magnitude — at the cost of not
 running real Python servers, `apt install`, or outbound HTTPS.
+
+<br/>
 
 ## Quick start
 
@@ -244,6 +260,8 @@ with Sandbox() as sb:
     print(sb.eval("numpy.zeros(5).tolist()"))    # reuses warmed PID 1
 ```
 
+<br/>
+
 ## Operating in daemon mode
 
 The controller daemon owns the registry of snapshots and live
@@ -275,6 +293,8 @@ Full API reference: [`docs/API.md`](./docs/API.md).
 Operator runbook: [`docs/RUNBOOK.md`](./docs/RUNBOOK.md).
 Security posture: [`docs/SECURITY.md`](./docs/SECURITY.md).
 
+<br/>
+
 ## Repository layout
 
 ```
@@ -291,6 +311,8 @@ packaging/systemd/      systemd unit for the controller
 bench/                  Benchmark harness, chart generators, results
 docs/                   API.md, SECURITY.md, RUNBOOK.md
 ```
+
+<br/>
 
 ## Status
 
@@ -313,6 +335,8 @@ Production-readiness items not yet in this release:
 
 The roadmap and tracked work live in [GitHub issues](https://github.com/deeplethe/forkd/issues).
 
+<br/>
+
 ## Contributing
 
 Pull requests welcome. Before opening one, please:
@@ -322,6 +346,8 @@ Pull requests welcome. Before opening one, please:
 2. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --all` locally.
 3. Sign-off your commits (`git commit -s`).
 
+<br/>
+
 ## Star history
 
 <a href="https://star-history.com/#deeplethe/forkd&Date">
@@ -330,6 +356,8 @@ Pull requests welcome. Before opening one, please:
     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=deeplethe/forkd&type=Date">
   </picture>
 </a>
+
+<br/>
 
 ## License
 

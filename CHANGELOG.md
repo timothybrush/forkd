@@ -6,8 +6,59 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased — 0.1.5 (in flight)
 
+### v0.3 scaffolding (deferred — kept as honest record)
+
+> **Deferred to v0.4+.** Live-fork via memfd + uffd_wp is tracked in
+> [issue #101](https://github.com/deeplethe/forkd/issues/101). The
+> architecture has an open question on source-divergence sync that we
+> haven't sketched concretely enough to commit to weeks of Firecracker
+> maintenance for. v0.3 is now pursuing cheaper pause-window wins —
+> diff snapshots, NVMe + io_uring, pre-emptive background snapshot —
+> see [`docs/ROADMAP.md`](./docs/ROADMAP.md). The scaffolding below
+> stays in the repo because it's reusable when/if the project picks
+> the live-fork work back up.
+
+- **`MemoryBackend::Userfault` enum variant** in `forkd-vmm`,
+  reserved for the (now-deferred) live-branching design. Setting it
+  today errors out of `restore_many_with` with a pointer to
+  [`docs/design/userfaultfd.md`](./docs/design/userfaultfd.md); no
+  caller can accidentally rely on a behavior we haven't built.
+- **`forkd-uffd` crate, phase 1.** New workspace member containing the
+  library half of the userfaultfd page-fault handler. Implements
+  Firecracker's UDS handshake: `recvmsg` with `SCM_RIGHTS` to receive
+  the uffd file descriptor + a JSON-encoded `Vec<GuestRegionUffdMapping>`
+  describing the host VAs of guest memory regions. Wire-compatible with
+  Firecracker v1.10.1's `src/firecracker/examples/uffd/uffd_utils.rs`.
+  Ships a `forkd-uffd-handler` binary that accepts the handshake and
+  exits — no `UFFDIO_COPY` event loop. Round-trip handshake test
+  paired over `socketpair(2)` so CI exercises the parser without
+  needing a real Firecracker. Reusable as-is if the live-fork plan
+  revives; orthogonal value as a reference implementation of the
+  Firecracker uffd protocol.
+- **`firecracker-patch/`** — design doc and first-cut `.patch` for
+  the `MemoryBackend::Memfd` Firecracker extension. Not compile-tested.
+  Deferred along with the rest; the README in that directory now
+  carries a prominent "DEFERRED" banner pointing at #101.
+
 ### Features
 
+- **Sandbox prewarm: amortize the cold-cache penalty at create time.**
+  New `"prewarm": true` field on `POST /v1/sandboxes`. When set, the
+  daemon performs a throwaway snapshot to scratch storage
+  (configurable, default `/dev/shm/forkd-prewarm`) immediately after
+  each child is restored, faulting in all guest pages and populating
+  KVM EPT. After prewarm, the first user-visible BRANCH runs at
+  steady-state speed instead of paying the measured 2-9x cold-cache
+  penalty (see
+  [`bench/pause-window/RESULTS-v0.2.md`](./bench/pause-window/RESULTS-v0.2.md)).
+  The cold cost is **moved**, not eliminated: sandbox creation pays
+  one cold-pause-window worth of latency in exchange for a consistent
+  BRANCH latency from the first call. Useful when BRANCH is the
+  request handler with an SLO; not useful for create-then-one-BRANCH
+  end-to-end latency. Off by default — opt in via the request body.
+  Implemented in `forkd-vmm` as `Vm::prewarm()` +
+  `ForkOpts::prewarm_scratch_dir`; daemon adds `--prewarm-scratch-dir`
+  flag / `FORKD_PREWARM_SCRATCH_DIR` env var.
 - **forkd Hub MVP**. `forkd pull <owner>/<name>` resolves through a
   registry.json published in this repo and downloads
   `.forkd-snapshot.tar.zst` packs from GitHub Releases. sha256-

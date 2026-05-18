@@ -9,10 +9,7 @@ Current release: **v0.2** (sandbox branching shipped, see commits
 
 ## v0.3 candidates — picked
 
-### Live (no-pause) branching via userfaultfd
-
-The single biggest technical bet in the v0.3 cycle, and a possible
-top-venue paper (HotInfra '26 / NSDI '27).
+### Cut pause-window without forking Firecracker
 
 **Problem.** Today's `POST /v1/sandboxes/:id/branch` pauses the source
 sandbox while `vm.snapshot_to()` writes `memory.bin` — typically
@@ -33,34 +30,30 @@ monotonic catch-up on resume races the recv data delivery. Full
 methodology and raw data in
 [`bench/pause-window/RESULTS-v0.2.md`](../bench/pause-window/RESULTS-v0.2.md).
 
-**Idea.** Register the source VM's guest memory with `userfaultfd`,
-keep the VM running, and copy pages on first child fault rather than
-upfront. Cold-start floor drops from ~150 ms (today, dominated by
-memory.bin mmap + restore) to ~10–30 ms (vCPU restore + first-page
-fault round-trips).
+**Approach.** Three engineering wins that stack and don't require any
+Firecracker fork. The original "live branching via memfd + uffd_wp"
+plan is deferred to v0.4+ — see
+[issue #101](https://github.com/deeplethe/forkd/issues/101) for the
+honest cost-benefit reasoning that led to the deferral. Scaffolding
+from that earlier plan (the design doc, `crates/forkd-uffd/`,
+`MemoryBackend::Userfault` enum, `firecracker-patch/`) is preserved
+as record.
 
-**Why this is research-grade, not engineering.** Prior art (MITOSIS
-NSDI '23, FaaSnap ATC '22, Klotski OSDI '22, NFork EuroSys '24) all
-do related work but each makes different trade-offs: RDMA-backed
-copy, snapshot speedup, VM-CoW for serverless, fork for FaaS. forkd
-in this mode would be the first **open-source, mmap-based,
-agent-oriented** live-fork — and the measurement story (pause window
-deltas across 7+ systems on a common bench) is paper-shaped on its
-own.
+| Phase | What | Expected win | ETA |
+|---|---|---|---|
+| 1 | **Diff snapshots.** Firecracker already supports `enable_diff_snapshots: true` + `track_dirty_pages`. Wire forkd's BRANCH path to take diff snapshots when a parent exists for the source, so repeated fan-out from the same source only writes pages dirtied since the last snapshot. | 5–10x on 2nd+ BRANCH from the same source. Typical agent fan-out (1 source, N children, fork after some work) hits this case. | 3–5 days |
+| 2 | **NVMe + io_uring snapshot writer.** Document the storage-tier choice, ship a daemon flag that uses io_uring for the memory.bin write when available. NVMe + io_uring already approximates what's achievable without changing the snapshot algorithm. | SSD 10×+ (~400 ms for 513 MiB, vs. 4.26 s today on SATA). | 1 week incl. measurement |
+| 3 | **Pre-emptive background snapshot.** Background thread writes source's dirty pages to a staging memory.bin on a tick (1 s default). At BRANCH, only flush what's dirty since the last tick. Source's pause window becomes O(tick) instead of O(source memory). | Pause window bounded by tick interval (~50 ms for 1 s tick on a typical workload) regardless of source size. | 1–2 weeks |
+| 4 | **Measurement + RESULTS-v0.3.md.** A/B numbers for each phase plus the stacked combo. Reuses the v0.2 bench harness. | Documentation. | 3 days |
 
-**Sketch (4–6 weeks part-time)**
+Phases 1 and 2 are independently shippable. Phase 3 builds on phase 1's dirty-tracking
+plumbing. The combination should reduce typical-workflow pause-window from seconds to
+tens of milliseconds without changing the trust story (still vanilla Firecracker).
 
-| Phase | Weeks | What |
-|---|---|---|
-| 1 | 1-2 | Understand userfaultfd boundary: UFFDIO_REGISTER, UFFDIO_COPY/COPY_ZEROPAGE, UFFD_FEATURE_WP. Add `MemoryBackend::Userfault` mode to `forkd-vmm`. |
-| 2 | 2-3 | Wire `restore_many_with` to register a fault handler thread per child instead of `mmap`-ing the entire memory.bin upfront. |
-| 3 | 3-4 | Benchmark: cold-start floor on memory.bin sizes 256 MiB / 2 GiB / 8 GiB (vLLM-class). Target ~10–30 ms vs ~150 ms today. |
-| 4 | 4-5 | A/B test against `postgres-fixture` and `playwright-browser` recipes. Capture page-fault rate over time as agents diverge. |
-| 5 | 5-6 | HotInfra '26 paper first draft. Target submission ~July/August 2026. |
-
-**Out of scope for v0.3.** Cross-host live branching (needs RDMA or
-similar), persistent fault-handler dump-and-replay, fault-driven
-prefetch policies (those are v0.4+).
+**Out of scope for v0.3.** Live-fork via memfd + uffd_wp (deferred, see
+[#101](https://github.com/deeplethe/forkd/issues/101)). Cross-host live branching
+(needs RDMA or similar). Persistent fault-handler dump-and-replay. Fault-driven
+prefetch policies. These are v0.4+ candidates.
 
 ## v0.3 candidates — speculative
 

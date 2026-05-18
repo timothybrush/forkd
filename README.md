@@ -542,6 +542,29 @@ Issue-level tracking: [GitHub issues](https://github.com/deeplethe/forkd/issues)
 Release notes per version: [CHANGELOG.md](./CHANGELOG.md).
 Security posture and past advisories: [docs/SECURITY.md](./docs/SECURITY.md).
 
+**v0.3 work in flight** — cutting pause-window without forking
+Firecracker. Today's measurement: 163 ms (tmpfs) to 4.26 s (SATA SSD)
+for a 513 MiB source — see
+[`bench/pause-window/RESULTS-v0.2.md`](./bench/pause-window/RESULTS-v0.2.md).
+v0.3 stacks three engineering wins (all built on the existing
+Firecracker API):
+
+1. **Diff snapshots** — `enable_diff_snapshots` + `track_dirty_pages`,
+   wired into BRANCH for repeated fan-out. 5–10× on 2nd+ BRANCH.
+2. **NVMe + io_uring snapshot writer** — ~400 ms for 513 MiB vs. 4 s
+   on SATA today.
+3. **Pre-emptive background snapshot** — pause-window bounded by tick
+   interval, not by source memory size.
+
+The bigger v0.4+ candidate, live-fork via memfd + uffd_wp targeting
+~30 ms pause regardless of memory size, is tracked in
+[issue #101](https://github.com/deeplethe/forkd/issues/101). It's
+deferred because the source-divergence sync mechanism hasn't been
+sketched concretely enough to commit to weeks of Firecracker fork
+maintenance. Design doc + scaffolding (`crates/forkd-uffd/`,
+`firecracker-patch/`, `MemoryBackend::Userfault` enum) stay in the
+repo as honest record.
+
 > **0.1.4 contains daemon security fixes.** Two HIGH-class
 > validation gaps in `POST /v1/sandboxes` (path-traversal via
 > `snapshot_tag`) and `packaging/k8s/` (placeholder bearer token

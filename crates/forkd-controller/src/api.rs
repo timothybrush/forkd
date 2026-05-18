@@ -42,6 +42,21 @@ pub struct SnapshotInfo {
     /// None for non-BRANCH snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_ms: Option<u64>,
+    /// Phase 1a diff-snapshot measurement (when `measure_diff: true`
+    /// was set on the BRANCH request): time spent in the Diff
+    /// snapshot's `snapshot/create` call. Taken FIRST inside the
+    /// pause window, so this is a strict subset of `pause_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_ms: Option<u64>,
+    /// Phase 1a diff-snapshot measurement: on-disk allocated bytes of
+    /// the Diff snapshot file (= dirty page bytes). Pair with
+    /// `diff_logical_bytes` to compute the compression ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_physical_bytes: Option<u64>,
+    /// Phase 1a diff-snapshot measurement: logical size of the Diff
+    /// snapshot file. Equals the source's full guest-RAM size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_logical_bytes: Option<u64>,
 }
 
 /// `POST /v1/sandboxes/:id/branch` — pause a running sandbox, snapshot
@@ -53,6 +68,42 @@ pub struct BranchSandboxRequest {
     /// generates `branch-<source-id>-<unix-ts>`.
     #[serde(default)]
     pub tag: Option<String>,
+    /// Phase 1a measurement hook: take a Diff snapshot in addition to
+    /// the Full snapshot, and report timing + physical size for both
+    /// in the response. The Diff is taken FIRST (so it captures the
+    /// full dirty-since-restore bitmap), then the Full is taken (which
+    /// would have been taken anyway). The Diff file is discarded
+    /// immediately after measurement.
+    ///
+    /// Doesn't change snapshot semantics — the returned `SnapshotInfo`
+    /// still references the Full snapshot. Used by
+    /// `bench/pause-window/sweep-diff.sh` to A/B the two paths on the
+    /// same source. Phase 1b will replace this with a real diff-based
+    /// BRANCH path that produces a restorable shadow file.
+    #[serde(default)]
+    pub measure_diff: bool,
+    /// Phase 1b: take a Diff snapshot during pause and reconstruct the
+    /// full memory.bin asynchronously around it. The source's pause
+    /// window shrinks to the Diff write (~250 ms for an idle source)
+    /// while total BRANCH wall-clock stays roughly O(memory size) —
+    /// the difference is that the source keeps running during the
+    /// O(memory) copy work.
+    ///
+    /// Concrete sequence in the daemon:
+    /// 1. Kick off a background `std::fs::copy(source_tag/memory.bin →
+    ///    snap_dir/memory.bin)`. Source is still running during this.
+    /// 2. `pause()` source.
+    /// 3. `snapshot_diff_to(snap_dir/vmstate, /tmp/diff.bin)` — the
+    ///    only thing the user actually waits on.
+    /// 4. `resume()` source.
+    /// 5. Wait for step 1 to finish.
+    /// 6. `apply_diff(diff.bin, snap_dir/memory.bin)` — small write.
+    ///
+    /// Mutually exclusive with `measure_diff` (which is a pure
+    /// measurement hook, doesn't change the snapshot path). When both
+    /// are set, the daemon errors with 400.
+    #[serde(default)]
+    pub diff: bool,
 }
 
 /// `POST /v1/sandboxes` — fork a sandbox (child VM) from a snapshot tag.
@@ -98,6 +149,14 @@ pub struct SandboxInfo {
     pub created_at_unix: u64,
     pub pid: Option<u32>,
     pub memory_limit_mib: Option<u64>,
+    /// Set to true once any BRANCH (Full or Diff) has been taken from
+    /// this sandbox. Used to reject subsequent `diff: true` BRANCHes:
+    /// Firecracker's dirty bitmap is cleared on every snapshot, so a
+    /// second Diff would miss pages dirtied before the first BRANCH.
+    /// Multi-BRANCH diff support needs a per-sandbox shadow file —
+    /// deferred to v0.3.1+; see docs/design/diff-snapshots.md.
+    #[serde(default)]
+    pub has_branched: bool,
 }
 
 /// `POST /v1/sandboxes/:id/exec`

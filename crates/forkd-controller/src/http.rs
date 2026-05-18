@@ -18,6 +18,7 @@
 //!
 //! Auth and audit logging are layered on top of this router in
 //! `lib.rs::run_daemon`. Tests in this file exercise the bare router.
+use anyhow::Context as _;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -270,6 +271,9 @@ async fn create_snapshot(
         created_at_unix: unix_now(),
         branched_from: None,
         pause_ms: None,
+        diff_ms: None,
+        diff_physical_bytes: None,
+        diff_logical_bytes: None,
     };
     if let Err(e) = s.registry.insert_snapshot(info.clone()) {
         return server_error(&format!("persist snapshot: {e:#}"));
@@ -410,6 +414,11 @@ async fn create_sandbox(
         // v0.2 ships only File. Userfault (live branching) lands in v0.3
         // — see docs/design/userfaultfd.md.
         memory_backend: forkd_vmm::MemoryBackend::File,
+        // Daemon-spawned sources are the targets of BRANCH; enabling
+        // dirty-page tracking lets later BRANCHes opt into Diff
+        // snapshots (see docs/design/diff-snapshots.md). The cost is
+        // ~1 bit per page; negligible.
+        enable_diff_snapshots: true,
     };
     // Per-snapshot-tag work_dir would clash if two batches of the same tag
     // ran concurrently (e.g. two branches of the same source). Mix the
@@ -457,6 +466,7 @@ async fn create_sandbox(
                 created_at_unix: now,
                 pid: Some(vm.pid()),
                 memory_limit_mib: req.memory_limit_mib,
+                has_branched: false,
             };
             if let Err(e) = s.registry.insert_sandbox(info.clone()) {
                 tracing::error!(error=%e, "persist sandbox failed");
@@ -532,6 +542,14 @@ async fn branch_sandbox(
         }
     };
 
+    if req.measure_diff && req.diff {
+        return bad_request(
+            "set at most one of `measure_diff` / `diff`: \
+             measure_diff is the pure measurement hook (Full path + Diff sidecar timing); \
+             diff is the real diff-based BRANCH path",
+        );
+    }
+
     let snap_dir = s.snapshot_root.join(&tag);
     if snap_dir.join("vmstate").exists() {
         return conflict(&format!("snapshot {} already exists; DELETE first", tag));
@@ -540,10 +558,22 @@ async fn branch_sandbox(
     // Look up the source sandbox's snapshot_tag so we can inherit its volumes
     // into the branch. Branches without inherited volumes wouldn't be able to
     // re-attach the parent's persistent disks on restore.
-    let source_snapshot_tag = match s.registry.get_sandbox(&id) {
-        Some(info) => info.snapshot_tag,
+    let (source_snapshot_tag, source_has_branched) = match s.registry.get_sandbox(&id) {
+        Some(info) => (info.snapshot_tag, info.has_branched),
         None => return not_found(&format!("sandbox {id}")),
     };
+    if req.diff && source_has_branched {
+        // Firecracker's dirty bitmap is cleared on every snapshot/create,
+        // so a second Diff would miss pages dirtied before the first
+        // BRANCH. Phase 1b ships single-BRANCH-per-sandbox diff support;
+        // multi-BRANCH requires a per-sandbox shadow file, deferred to
+        // v0.3.1+ — see docs/design/diff-snapshots.md.
+        return bad_request(
+            "diff BRANCH is only valid for a sandbox that has NOT been BRANCHed before. \
+             For subsequent BRANCHes use full snapshot mode (diff: false). \
+             Multi-BRANCH diff support is deferred to v0.3.1+.",
+        );
+    }
     let source_volumes = match read_snapshot_volumes(&s.snapshot_root, &source_snapshot_tag) {
         Ok(v) => v,
         Err(e) => {
@@ -566,57 +596,190 @@ async fn branch_sandbox(
 
     let snap_dir_for_task = snap_dir.clone();
     let id_for_log = id.clone();
+    let measure_diff = req.measure_diff;
+    let diff_mode = req.diff;
+    let source_memory_path = s
+        .snapshot_root
+        .join(&source_snapshot_tag)
+        .join("memory.bin");
+    type DiffMetrics = Option<(u64, u64, u64)>; // (ms, physical_bytes, logical_bytes)
     let task_result = tokio::task::spawn_blocking(
         move || -> (
             forkd_vmm::Vm,
             anyhow::Result<forkd_vmm::Snapshot>,
             Option<u64>,
+            DiffMetrics,
         ) {
             let mut pause_ms: Option<u64> = None;
+            let mut diff_metrics: DiffMetrics = None;
             let snap_result = (|| -> anyhow::Result<forkd_vmm::Snapshot> {
                 std::fs::create_dir_all(&snap_dir_for_task)?;
-                // pause→resume window is the value the v0.3 userfaultfd
-                // bet wants to shrink. Measure both around the entire
-                // snapshot, since the user's source VM is unavailable the
-                // whole time.
+
+                // Phase 1b: if `diff` mode, kick off a background copy of
+                // the source tag's memory.bin → snap_dir/memory.bin BEFORE
+                // we pause. The source runs concurrently. After the diff
+                // snapshot finishes (fast) and we resume, we join the
+                // copy and apply the diff onto its output. Source's pause
+                // window collapses to just the diff_ms.
+                let copy_handle: Option<std::thread::JoinHandle<std::io::Result<u64>>> =
+                    if diff_mode {
+                        let src = source_memory_path.clone();
+                        let dst = snap_dir_for_task.join("memory.bin");
+                        Some(std::thread::spawn(move || std::fs::copy(&src, &dst)))
+                    } else {
+                        None
+                    };
+
                 let pause_start = std::time::Instant::now();
                 vm.pause()?;
-                let snap = vm.snapshot_to(
-                    snap_dir_for_task.join("vmstate"),
-                    snap_dir_for_task.join("memory.bin"),
-                    // Inherit volumes from the source snapshot so grandchildren
-                    // re-attach the same persistent disks the source had.
-                    source_volumes,
-                )?;
-                // resume() may fail after a successful snapshot. The snapshot file
-                // is intact and usable; the source sandbox is in an unknown state
-                // (most likely still paused). We log and continue rather than
-                // returning Err, because the user's primary expectation (a valid
-                // new snapshot) has been met.
-                let resume_result = vm.resume();
-                pause_ms = Some(pause_start.elapsed().as_millis() as u64);
-                if let Err(e) = resume_result {
-                    tracing::warn!(
+
+                // Phase 1a measurement hook: take a Diff snapshot first
+                // (captures pages dirtied since restore; clears the dirty
+                // bitmap). Discarded after metrics. The subsequent Full
+                // snapshot still writes every page, so the post-resume
+                // snapshot state is unchanged.
+                if measure_diff {
+                    let diff_dir = std::env::temp_dir()
+                        .join(format!("forkd-diff-measure-{}", std::process::id()));
+                    std::fs::create_dir_all(&diff_dir)
+                        .context("create diff measurement scratch dir")?;
+                    let diff_vmstate = diff_dir.join("diff-vmstate");
+                    let diff_mem = diff_dir.join("diff-memory.bin");
+                    let diff_start = std::time::Instant::now();
+                    let diff_snap = vm
+                        .snapshot_diff_to(
+                            diff_vmstate.clone(),
+                            diff_mem.clone(),
+                            Vec::new(),
+                        )
+                        .context("diff snapshot")?;
+                    let diff_ms = diff_start.elapsed().as_millis() as u64;
+                    diff_metrics = Some((
+                        diff_ms,
+                        diff_snap.physical_size_bytes,
+                        diff_snap.logical_size_bytes,
+                    ));
+                    // Discard the diff files — they were measurement-only.
+                    let _ = std::fs::remove_file(&diff_vmstate);
+                    let _ = std::fs::remove_file(&diff_mem);
+                    let _ = std::fs::remove_dir(&diff_dir);
+                }
+
+                let snap = if diff_mode {
+                    // Diff path: take a Diff snapshot into a temp file,
+                    // resume the source, then merge the diff onto the
+                    // pre-copied snap_dir/memory.bin.
+                    let diff_path = std::env::temp_dir().join(format!(
+                        "forkd-branch-diff-{}-{}.bin",
+                        std::process::id(),
+                        unix_now()
+                    ));
+                    let diff_start = std::time::Instant::now();
+                    let diff_snap = vm
+                        .snapshot_diff_to(
+                            snap_dir_for_task.join("vmstate"),
+                            diff_path.clone(),
+                            source_volumes.clone(),
+                        )
+                        .context("diff snapshot (diff mode)")?;
+                    let diff_ms = diff_start.elapsed().as_millis() as u64;
+                    diff_metrics = Some((
+                        diff_ms,
+                        diff_snap.physical_size_bytes,
+                        diff_snap.logical_size_bytes,
+                    ));
+                    let resume_result = vm.resume();
+                    pause_ms = Some(pause_start.elapsed().as_millis() as u64);
+
+                    // Wait for the background memory.bin copy to finish.
+                    let copy_bytes = copy_handle
+                        .expect("copy_handle set in diff_mode")
+                        .join()
+                        .map_err(|e| anyhow::anyhow!("copy thread panicked: {:?}", e))?
+                        .context("copy source memory.bin to snap_dir")?;
+                    tracing::debug!(
                         sandbox = %id_for_log,
-                        pause_ms = pause_ms.unwrap_or(0),
-                        error = %e,
-                        "branch: source sandbox failed to resume after snapshot; snapshot file is intact"
+                        copy_bytes,
+                        diff_physical_bytes = diff_snap.physical_size_bytes,
+                        "diff-branch: source memory copy done"
                     );
-                } else {
+
+                    // Apply the diff onto the snap_dir/memory.bin in place.
+                    let merged_bytes =
+                        forkd_vmm::apply_diff(&diff_path, &snap_dir_for_task.join("memory.bin"))
+                            .context("apply_diff onto snap_dir memory")?;
+                    let _ = std::fs::remove_file(&diff_path);
                     tracing::info!(
                         sandbox = %id_for_log,
                         pause_ms = pause_ms.unwrap_or(0),
-                        "branch: source paused/resumed cleanly"
+                        diff_ms,
+                        diff_physical_bytes = diff_snap.physical_size_bytes,
+                        merged_bytes,
+                        "branch: diff-mode pause/resume + merge complete"
                     );
-                }
+                    if let Err(e) = resume_result {
+                        tracing::warn!(
+                            sandbox = %id_for_log,
+                            error = %e,
+                            "branch: source failed to resume after diff snapshot; snapshot file is intact"
+                        );
+                    }
+                    // Return a normal Snapshot pointing at the merged
+                    // memory.bin so the downstream Registry/serialization
+                    // path is unchanged.
+                    forkd_vmm::Snapshot {
+                        vmstate: diff_snap.vmstate,
+                        memory: snap_dir_for_task.join("memory.bin"),
+                        volumes: diff_snap.volumes,
+                    }
+                } else {
+                    let snap = vm.snapshot_to(
+                        snap_dir_for_task.join("vmstate"),
+                        snap_dir_for_task.join("memory.bin"),
+                        // Inherit volumes from the source snapshot so grandchildren
+                        // re-attach the same persistent disks the source had.
+                        source_volumes,
+                    )?;
+                    // resume() may fail after a successful snapshot. The snapshot file
+                    // is intact and usable; the source sandbox is in an unknown state
+                    // (most likely still paused). We log and continue rather than
+                    // returning Err, because the user's primary expectation (a valid
+                    // new snapshot) has been met.
+                    let resume_result = vm.resume();
+                    pause_ms = Some(pause_start.elapsed().as_millis() as u64);
+                    if let Err(e) = resume_result {
+                        tracing::warn!(
+                            sandbox = %id_for_log,
+                            pause_ms = pause_ms.unwrap_or(0),
+                            error = %e,
+                            "branch: source sandbox failed to resume after snapshot; snapshot file is intact"
+                        );
+                    } else if let Some((dms, dphys, dlog)) = diff_metrics {
+                        tracing::info!(
+                            sandbox = %id_for_log,
+                            pause_ms = pause_ms.unwrap_or(0),
+                            diff_ms = dms,
+                            diff_physical_bytes = dphys,
+                            diff_logical_bytes = dlog,
+                            "branch: source paused/resumed cleanly (with diff measurement)"
+                        );
+                    } else {
+                        tracing::info!(
+                            sandbox = %id_for_log,
+                            pause_ms = pause_ms.unwrap_or(0),
+                            "branch: source paused/resumed cleanly"
+                        );
+                    }
+                    snap
+                };
                 Ok(snap)
             })();
-            (vm, snap_result, pause_ms)
+            (vm, snap_result, pause_ms, diff_metrics)
         },
     )
     .await;
 
-    let (vm_back, snap_or_err, pause_ms) = match task_result {
+    let (vm_back, snap_or_err, pause_ms, diff_metrics) = match task_result {
         Ok(t) => t,
         Err(e) => {
             // Blocking task panicked; we lost the Vm value. The OS still has the
@@ -631,6 +794,13 @@ async fn branch_sandbox(
     // returned `vm` (its Drop kills firecracker + cleans cgroup).
     if s.registry.get_sandbox(&id).is_some() {
         s.live_vms.lock().insert(id.clone(), vm_back);
+        // Mark this sandbox as having been BRANCHed so subsequent
+        // diff: true requests get a clean 400 instead of producing a
+        // stale snapshot. Both Full and Diff clear the dirty bitmap;
+        // either way the next Diff would be wrong without a shadow file.
+        if let Err(e) = s.registry.mark_branched(&id) {
+            tracing::warn!(sandbox = %id, error = %e, "failed to persist has_branched flag");
+        }
     } else {
         drop(vm_back);
     }
@@ -657,12 +827,19 @@ async fn branch_sandbox(
         return server_error(&format!("write snapshot.json: {e}"));
     }
 
+    let (diff_ms, diff_physical_bytes, diff_logical_bytes) = match diff_metrics {
+        Some((ms, phys, log)) => (Some(ms), Some(phys), Some(log)),
+        None => (None, None, None),
+    };
     let info = SnapshotInfo {
         tag: tag.clone(),
         dir: snap_dir.display().to_string(),
         created_at_unix: unix_now(),
         branched_from: Some(id.clone()),
         pause_ms,
+        diff_ms,
+        diff_physical_bytes,
+        diff_logical_bytes,
     };
     if let Err(e) = s.registry.insert_snapshot(info.clone()) {
         return server_error(&format!("persist snapshot: {e:#}"));
@@ -1240,6 +1417,7 @@ mod tests {
                 created_at_unix: 1,
                 pid: Some(99999999),
                 memory_limit_mib: None,
+                has_branched: false,
             })
             .unwrap();
         let app = router(s);

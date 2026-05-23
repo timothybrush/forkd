@@ -36,6 +36,14 @@ forkd 基于 Firecracker 构建。父 VM 启动一次,把运行时(Python +
 由此同时获得两个特性:**每个子 VM 都是独立的 KVM 隔离**,
 同时**单个子 VM 的启动成本接近 `fork(2)`,而非冷启动 VM**。
 
+forkd 同时支持 **BRANCH**:把正在运行的沙箱暂停,把它当下的
+in-flight 状态做成快照,再恢复 —— 整套 ~150 ms —— 让 agent
+能在"思考过程中"叉出多条路径,而不只在暖启动时刻 fork。
+v0.3.4 修复了一个慢路径回归:在同一个父 VM 上反复 BRANCH 时,
+pause 时间会从 150 ms 涨到 2.7 s
+([#146](https://github.com/deeplethe/forkd/issues/146));修复后
+连续 BRANCH 保持平直(第 6 次 BRANCH 快了 17.6×)。
+
 <br/>
 
 ## Demo:让一个思考中的 agent 分裂

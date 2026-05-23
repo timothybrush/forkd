@@ -38,6 +38,13 @@ diverge.
 The result is two properties at once: per-child KVM isolation, and a
 spawn cost that's closer to `fork(2)` than to a cold-boot VM.
 
+forkd also supports **BRANCH**: pause a running sandbox, snapshot its
+in-flight state, and resume — all in ~150 ms — so an agent can fork
+mid-thought, not only at warm-up. v0.3.4 fixed a slow-path regression
+where repeated BRANCHes on the same parent ballooned from 150 ms to
+2.7 s ([#146](https://github.com/deeplethe/forkd/issues/146)); the
+chain now stays flat (17.6× faster on the 6th consecutive BRANCH).
+
 <br/>
 
 ## Demo: branch a thinking agent

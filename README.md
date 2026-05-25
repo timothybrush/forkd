@@ -45,6 +45,17 @@ where repeated BRANCHes on the same parent ballooned from 150 ms to
 2.7 s ([#146](https://github.com/deeplethe/forkd/issues/146)); the
 chain now stays flat (17.6× faster on the 6th consecutive BRANCH).
 
+**v0.4 preview**: an experimental live-fork path drops the BRANCH
+pause window from ~150 ms to ~3 ms per GiB by moving the memory
+write out of the critical section. Try the library API with
+`forkd wp-bench`:
+
+![forkd wp-bench v0.4 demo](./docs/assets/wp-bench-demo.gif)
+
+Full design: [`DESIGN-v0.4.md`](./DESIGN-v0.4.md). Empirical PoC data
+(3 PoCs, all passing): [`experiments/v0.4-*-poc/`](./experiments/).
+Tracking issue [#101](https://github.com/deeplethe/forkd/issues/101).
+
 <br/>
 
 ## Demo: branch a thinking agent

@@ -206,6 +206,14 @@ is straightforward — take a fresh snapshot with the patched FC,
 then re-run the test — but is left for the upstream PR's CI to
 exercise rather than blocking this proposal on it.
 
+## Filing status
+
+**Upstream issue filed 2026-05-25:** [firecracker-microvm/firecracker#5912](https://github.com/firecracker-microvm/firecracker/issues/5912).
+
+Waiting for maintainer response on API shape before sending PR.
+The patch ([`0001-feat-mem-backend-shared-option-for-MAP-SHARED.patch`](./0001-feat-mem-backend-shared-option-for-MAP-SHARED.patch))
+is ready to send.
+
 ## Filing plan
 
 1. Open a Firecracker issue laying out the use case (~200 words,

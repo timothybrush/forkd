@@ -44,6 +44,16 @@ pause 时间会从 150 ms 涨到 2.7 s
 ([#146](https://github.com/deeplethe/forkd/issues/146));修复后
 连续 BRANCH 保持平直(第 6 次 BRANCH 快了 17.6×)。
 
+**v0.4 预览**:实验性的 live-fork 路径把 BRANCH 卡顿窗口从 ~150 ms
+降到每 GiB ~3 ms ——做法是把内存写出从临界区移出。可用 `forkd wp-bench`
+试 library API:
+
+![forkd wp-bench v0.4 demo](./docs/assets/wp-bench-demo-zh.gif)
+
+完整设计:[`DESIGN-v0.4.md`](./DESIGN-v0.4.md)。4 个 PoC 实证数据
+全部通过:[`experiments/v0.4-*-poc/`](./experiments/)。跟踪 issue
+[#101](https://github.com/deeplethe/forkd/issues/101)。
+
 <br/>
 
 ## Demo:让一个思考中的 agent 分裂

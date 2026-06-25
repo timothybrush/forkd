@@ -256,7 +256,7 @@ Request:
 
 - `tag` is optional. When unset the daemon generates
   `branch-<source-id>-<unix-ts>`. Must match
-  `^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$`.
+  `^[A-Za-z0-9_-]{1,64}$` (1–64 chars, ASCII alphanumeric plus `-`/`_`).
 - `mode` (v0.4+) is one of `"full"`, `"diff"`, `"live"`. Defaults to
   `"full"` when unset. `"live"` requires the source sandbox to have
   been spawned with `live_fork: true` and the host to support UFFD_WP
